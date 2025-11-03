@@ -1,0 +1,52 @@
+# ==========================================
+# Global Configuration for Orderflow Forecasting
+# ==========================================
+
+# Where processed data and models will live
+storage:
+  root: "./data"
+
+# Assets to track — you can add/remove freely
+symbols:
+  - BTC-USD
+  - ETH-USD
+  - SPX500USD       # S&P 500 index CFD / futures symbol
+  - NASDAQ100USD    # Nasdaq 100 index
+  - RUSSELL2000USD  # Russell 2000 index
+  - STOXX50EUSD     # Euro Stoxx 50
+  - GER40EUR        # DAX / Germany 40
+  - FTSE100GBP      # FTSE 100
+  - XAUUSD          # Gold
+  - XAGUSD          # Silver
+
+# Horizons for forward-return labeling (prediction targets)
+horizons:
+  - 1d
+  - 1w
+  - 1m
+
+# Update frequency of your dataset
+frequency: "1h"    # can also be "1d" for daily bars
+
+# Data vendors (for future ingestion scripts)
+data_sources:
+  ohlcv: "local_csv"       # placeholder for where you get bar data
+  options: "local_csv"     # placeholder for options or derivatives data
+
+# Modeling parameters (we’ll use these in train.py later)
+model:
+  type: "xgboost"
+  params:
+    max_depth: 3
+    n_estimators: 200
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+# Paths (auto-created by scripts)
+paths:
+  raw: "data/raw"
+  interim: "data/interim"
+  processed: "data/processed"
+  models: "models"
+  reports: "reports"
