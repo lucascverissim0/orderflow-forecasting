@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+.env
+.venv/
+venv/
+ENV/
+env/
+.ipynb_checkpoints/
+
+# Data
+data/raw/
+data/interim/
+data/processed/
+reports/
+logs/
+models/
+
+# Node / frontend
+app/node_modules/
+app/.next/
+app/dist/
+app/build/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Misc
+*.log
+*.tmp
