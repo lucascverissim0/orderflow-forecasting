@@ -15,23 +15,19 @@ from orderflow.utils.config import get_config
 from orderflow.utils.io import read_parquet, write_parquet
 
 
-# ---------------------------------------------------------------------
-# Local helper
-# ---------------------------------------------------------------------
+# ---------- local helper ------------------------------------------------------
 
 def ensure_parent_dir(path: str | Path) -> None:
     """Ensure the parent directory of `path` exists."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------
-# Labeling logic
-# ---------------------------------------------------------------------
+# ---------- labeling logic ----------------------------------------------------
 
 HORIZON_TO_TIMEDelta = {
     "1d": pd.Timedelta(days=1),
     "1w": pd.Timedelta(weeks=1),
-    "1m": pd.Timedelta(days=30),  # approximate monthly horizon
+    "1m": pd.Timedelta(days=30),  # simple monthly approximation for MVP
 }
 
 
@@ -55,12 +51,11 @@ def _forward_return_for_horizon(bars: pd.DataFrame, horizon: str) -> pd.Series:
     df = _ensure_datetime(df, "timestamp")
     df = df.dropna(subset=["timestamp", "symbol", "close"]).sort_values(["symbol", "timestamp"])
 
-    # Create future frame shifted back by delta
+    # Create a future frame shifted BACK by delta so merge_asof@forward hits t+delta
     future = df.copy()
     future["timestamp"] = future["timestamp"] - delta
     future = future.rename(columns={"close": "close_future"})
 
-    # merge_asof aligns each t with t+delta
     merged = pd.merge_asof(
         df.sort_values("timestamp"),
         future.sort_values("timestamp"),
@@ -70,27 +65,18 @@ def _forward_return_for_horizon(bars: pd.DataFrame, horizon: str) -> pd.Series:
     ).sort_values(["symbol", "timestamp"])
 
     ret = (merged["close_future"] / merged["close"] - 1.0).rename(f"ret_{horizon}")
-
-    # MultiIndex Series
     ret.index = pd.MultiIndex.from_frame(merged[["timestamp", "symbol"]], names=["timestamp", "symbol"])
     return ret
 
 
 def compute_labels(bars: pd.DataFrame, horizons: list[str]) -> pd.DataFrame:
     """Return DataFrame indexed by (timestamp, symbol) with columns ret_<horizon>."""
-    series_list = []
-    for h in horizons:
-        s = _forward_return_for_horizon(bars, h)
-        series_list.append(s)
-
-    labels = pd.concat(series_list, axis=1)
-    labels = labels.sort_index()
+    series_list = [_forward_return_for_horizon(bars, h) for h in horizons]
+    labels = pd.concat(series_list, axis=1).sort_index()
     return labels
 
 
-# ---------------------------------------------------------------------
-# CLI entrypoint
-# ---------------------------------------------------------------------
+# ---------- CLI entrypoint ----------------------------------------------------
 
 def main():
     cfg = get_config()
@@ -105,7 +91,13 @@ def main():
     bars = read_parquet(bars_path)
     bars = _ensure_datetime(bars, "timestamp")
 
-    horizons = cfg.get("horizons", ["1d", "1w", "1m"])
+    # Pydantic Settings is attribute-based, not dict-like.
+    horizons = getattr(cfg, "horizons", None)
+    if not horizons:
+        horizons = ["1d", "1w", "1m"]
+    # ensure list[str]
+    horizons = list(horizons)
+
     labels = compute_labels(bars, horizons=horizons)
 
     write_parquet(labels.reset_index(), out_path)
