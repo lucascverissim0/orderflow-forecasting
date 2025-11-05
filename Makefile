@@ -1,50 +1,55 @@
-# Simple automation for your batch pipeline + web app
+SHELL := /bin/bash
 
-PY := python
+# Binaries & paths
+PY        ?= python
+PIP       ?= pip
+APP_DIR   ?= app
+API_PORT  ?= 8000
+UI_PORT   ?= 3000
 
-.PHONY: help setup dirs features labels train score api ui all clean
+.PHONY: help setup demo features labels train score all api ui clean
 
 help:
 	@echo "Targets:"
-	@echo "  setup     - install Python deps from requirements.txt"
-	@echo "  dirs      - create data/models/reports folders"
-	@echo "  features  - compute microstructure + options features"
-	@echo "  labels    - compute forward-return labels"
-	@echo "  train     - train the 1d model"
-	@echo "  score     - generate predictions with the trained model"
-	@echo "  api       - start FastAPI on :8000"
-	@echo "  ui        - start Next.js dev server on :3000"
-	@echo "  all       - features + labels + train + score (end-to-end)"
-	@echo "  clean     - remove generated artifacts (safe)"
+	@echo "  setup     - Install Python package (editable) + reqs, and install UI deps"
+	@echo "  demo      - Generate synthetic demo data (bars + empty options)"
+	@echo "  features  - Build microstructure + options features"
+	@echo "  labels    - Build forward-return labels"
+	@echo "  train     - Train 1D model"
+	@echo "  score     - Score 1D model -> preds"
+	@echo "  all       - End-to-end: features -> labels -> train -> score"
+	@echo "  api       - Start FastAPI server on port $(API_PORT)"
+	@echo "  ui        - Start Next.js dev server on port $(UI_PORT)"
+	@echo "  clean     - Remove models/reports/processed artifacts"
 
 setup:
-	$(PY) -m pip install --upgrade pip
-	$(PY) -m pip install -r requirements.txt
+	$(PIP) install -e .
+	@if [ -f requirements.txt ]; then $(PIP) install -r requirements.txt; fi
+	@if [ -f $(APP_DIR)/package.json ]; then npm ci --prefix $(APP_DIR); fi
 
-dirs:
-	@mkdir -p data/raw data/interim data/processed models reports/metrics
+demo:
+	$(PY) scripts/make_demo_data.py
 
-features: dirs
+features:
 	$(PY) -m orderflow.features.microstructure
 	$(PY) -m orderflow.features.options_flow
 
-labels: dirs
+labels:
 	$(PY) -m orderflow.features.labeling
 
-train: dirs
+train:
 	$(PY) -m orderflow.modeling.train
 
-score: dirs
+score:
 	$(PY) -m orderflow.modeling.score
-
-api:
-	uvicorn orderflow.serving.api:app --reload --port 8000
-
-ui:
-	cd app && npm install && npm run dev
 
 all: features labels train score
 
+api:
+	$(PY) -m uvicorn orderflow.serving.api:app --reload --port $(API_PORT)
+
+ui:
+	npm --prefix $(APP_DIR) run dev -- --port $(UI_PORT)
+
 clean:
-	@rm -rf data/processed/* reports/* models/*
-	@echo "Cleaned generated artifacts."
+	@rm -rf models/*.json reports/*.json data/processed/*.parquet 2>/dev/null || true
