@@ -1,179 +1,212 @@
 """
-api.py
-------
-Minimal FastAPI backend to serve symbols, timeseries (features), and predictions
-to the frontend. Reads Parquet artifacts produced by the batch pipeline.
+FastAPI backend for the orderflow-forecasting MVP (batch).
 
-Endpoints:
+Endpoints
 - GET /health
-- GET /symbols
-- GET /timeseries?symbol=BTC-USD&start=2024-01-01&end=2025-01-01
-- GET /predictions?symbol=BTC-USD&start=2024-01-01&end=2025-01-01
-- GET /latest?symbol=BTC-USD
+- GET /symbols                     -> ["BTC-USD", "ETH-USD", ...]
+- GET /timeseries?symbol=&start=&end=
+- GET /predictions?symbol=&start=&end=
+- GET /latest?symbol=
 
-Run locally:
-  uvicorn orderflow.serving.api:app --reload --port 8000
+Notes
+- CORS is permissive for local/Codespaces dev. Lock down for prod.
+- All file reads are resilient; empty/missing inputs return [].
 """
 
 from __future__ import annotations
-from typing import Optional, List
-import os
+
+from pathlib import Path
+from typing import List, Optional
+
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from orderflow.utils.config import get_config
-from orderflow.utils.io import load_or_empty_parquet, read_parquet
+from orderflow.utils.io import read_parquet
 
+DATA_INTERIM = Path("data/interim")
+DATA_PROCESSED = Path("data/processed")
 
-app = FastAPI(title="Orderflow Forecasting API", version="0.1.0")
+app = FastAPI(title="orderflow-forecasting API", version="0.1.0")
 
-# CORS (allow local Next.js, etc.)
+# ---- Dev CORS (broad; tighten for prod) -------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],      # ok for dev; prefer your specific frontend origin(s) in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ------------ helpers ------------ #
+# ---- Helpers ----------------------------------------------------------------
 
-def _dtindex(df: pd.DataFrame) -> pd.DataFrame:
-    if "timestamp" in df.columns:
-        df = df.set_index("timestamp")
-    return df.sort_index()
+def _ensure_dt(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
+    if col in df.columns and not pd.api.types.is_datetime64_any_dtype(df[col]):
+        df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    return df
 
-def _filter(df: pd.DataFrame, symbol: Optional[str], start: Optional[str], end: Optional[str]) -> pd.DataFrame:
-    if df.empty:
-        return df
-    if symbol and "symbol" in df.columns:
-        df = df[df["symbol"] == symbol]
+
+def _normalize_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure 'timestamp' and 'symbol' are normal columns."""
+    if "timestamp" not in df.columns:
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index().rename(columns={"index": "timestamp"})
+        else:
+            for alt in ("datetime", "time", "date", "ts"):
+                if alt in df.columns:
+                    df = df.rename(columns={alt: "timestamp"})
+                    break
+    if "symbol" not in df.columns:
+        if isinstance(df.index, pd.MultiIndex) and "symbol" in df.index.names:
+            df = df.reset_index()
+        else:
+            for alt in ("ticker", "asset", "sym"):
+                if alt in df.columns:
+                    df = df.rename(columns={alt: "symbol"})
+                    break
+    return df
+
+
+def _read_micro() -> pd.DataFrame:
+    p = DATA_PROCESSED / "microstructure.parquet"
+    if not p.exists():
+        return pd.DataFrame(columns=["timestamp", "symbol"])
+    df = read_parquet(str(p))
+    df = _normalize_keys(df)
+    df = _ensure_dt(df, "timestamp")
+    return df
+
+
+def _read_options_features() -> pd.DataFrame:
+    p = DATA_PROCESSED / "options_features.parquet"
+    if not p.exists():
+        return pd.DataFrame()
+    df = read_parquet(str(p))
+    df = _normalize_keys(df)
+    df = _ensure_dt(df, "timestamp")
+    return df
+
+
+def _read_preds() -> pd.DataFrame:
+    p = DATA_PROCESSED / "preds_1d.parquet"
+    if not p.exists():
+        return pd.DataFrame(columns=["timestamp", "symbol", "pred_1d"])
+    df = read_parquet(str(p))
+    df = _normalize_keys(df)
+    df = _ensure_dt(df, "timestamp")
+    return df
+
+
+def _merge_features() -> pd.DataFrame:
+    micro = _read_micro()
+    opts = _read_options_features()
+    if micro.empty:
+        return micro
+    if not opts.empty:
+        df = pd.merge(
+            micro, opts,
+            on=["timestamp", "symbol"],
+            how="left",
+            suffixes=("", "_opt"),
+            validate="m:1",
+        )
+    else:
+        df = micro
+    if {"symbol", "timestamp"} <= set(df.columns):
+        df = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    return df
+
+
+def _filter_by_date(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     if start:
-        df = df[df.index >= pd.to_datetime(start)]
+        df = df[df["timestamp"] >= pd.to_datetime(start, utc=True, errors="coerce")]
     if end:
-        df = df[df.index <= pd.to_datetime(end)]
-    return df
-
-def _join_features() -> pd.DataFrame:
-    micro = load_or_empty_parquet("data/processed/microstructure.parquet")
-    opts  = load_or_empty_parquet("data/processed/options_features.parquet")
-    preds = load_or_empty_parquet("data/processed/preds_1d.parquet")
-
-    if not micro.empty:
-        micro = _dtindex(micro)
-    if not opts.empty:
-        opts = _dtindex(opts)
-    if not preds.empty:
-        preds = _dtindex(preds)
-
-    # Start with micro
-    df = micro.copy()
-
-    # Join options
-    if not opts.empty:
-        if "symbol" in df.columns:
-            df = (
-                df.reset_index()
-                  .merge(opts.reset_index(), on=["timestamp","symbol"], how="left", suffixes=("", "_opt"))
-                  .set_index("timestamp")
-                  .sort_index()
-            )
-        else:
-            df = df.join(opts, how="left", lsuffix="", rsuffix="_opt")
-
-    # Join predictions
-    if not preds.empty:
-        if "symbol" in df.columns and "symbol" in preds.columns:
-            df = (
-                df.reset_index()
-                  .merge(preds.reset_index(), on=["timestamp","symbol"], how="left")
-                  .set_index("timestamp")
-                  .sort_index()
-            )
-        else:
-            df = df.join(preds[["proba_up_1d","signal_1d"]], how="left")
-
+        df = df[df["timestamp"] <= pd.to_datetime(end, utc=True, errors="coerce")]
     return df
 
 
-# ------------ routes ------------ #
+# ---- Routes -----------------------------------------------------------------
 
 @app.get("/health")
 def health():
-    cfg = get_config()
-    return {"status": "ok", "symbols": cfg.symbols, "frequency": cfg.frequency}
+    return {"ok": True}
+
 
 @app.get("/symbols")
-def symbols():
+def symbols() -> List[str]:
+    """Return a plain list so the UI dropdown populates."""
     cfg = get_config()
-    # Prefer symbols found in microstructure if available
-    micro = load_or_empty_parquet("data/processed/microstructure.parquet")
-    if not micro.empty and "symbol" in micro.columns:
-        syms = sorted([str(s) for s in micro["symbol"].dropna().unique().tolist()])
-        if syms:
-            return {"symbols": syms}
-    return {"symbols": cfg.symbols}
+    syms = list(getattr(cfg, "symbols", [])) or []
+    return syms
+
 
 @app.get("/timeseries")
 def timeseries(
-    symbol: Optional[str] = Query(None, description="Symbol to filter (e.g., BTC-USD)"),
-    start: Optional[str] = Query(None, description="ISO start date (e.g., 2024-01-01)"),
-    end: Optional[str]   = Query(None, description="ISO end date (e.g., 2025-01-01)"),
-    limit: int = Query(5000, ge=1, le=20000, description="Max rows returned"),
+    symbol: str = Query(..., description="Symbol as in your config"),
+    start: Optional[str] = Query(None, description="ISO date/time"),
+    end: Optional[str] = Query(None, description="ISO date/time"),
 ):
-    df = _join_features()
+    df = _merge_features()
     if df.empty:
-        return {"rows": []}
-
-    df = _filter(df, symbol, start, end)
+        return []
+    df = df[df["symbol"] == symbol]
     if df.empty:
-        return {"rows": []}
+        return []
+    df = _filter_by_date(df, start, end)
 
-    # keep a sensible subset for the UI; extend as needed
-    cols_preferred = [
-        "symbol","open","high","low","close","volume",
-        "ret_1","delta_vol","cvd_proxy","cvd_z_50","cvd_z_200","bar_imbalance","vwap",
-        "pcr","at_ask_bias","opt_vol_intensity","iv_atm","skew_25d","d_iv_atm","d_skew_25d",
-        "proba_up_1d","signal_1d"
-    ]
-    cols = [c for c in cols_preferred if c in df.columns]
-    out = df[cols].tail(limit).reset_index().rename(columns={"index": "timestamp"})
-    # ensure timestamp is ISO
-    out["timestamp"] = out["timestamp"].astype("datetime64[ns]").dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT").astype(str)
-    return {"rows": out.to_dict(orient="records")}
+    # Keep a small, UI-friendly set of columns if present
+    cols = ["timestamp", "symbol", "close", "volume", "cvd", "pcr", "at_ask_bias"]
+    present = [c for c in cols if c in df.columns]
+    out = df[present].copy()
+
+    # Convert timestamp to ISO strings for JSON
+    out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return out.to_dict(orient="records")
+
 
 @app.get("/predictions")
 def predictions(
-    symbol: Optional[str] = Query(None),
+    symbol: str = Query(...),
     start: Optional[str] = Query(None),
-    end: Optional[str]   = Query(None),
-    limit: int = Query(5000, ge=1, le=20000),
+    end: Optional[str] = Query(None),
 ):
-    preds = load_or_empty_parquet("data/processed/preds_1d.parquet")
+    preds = _read_preds()
     if preds.empty:
-        return {"rows": []}
-    preds = _dtindex(preds)
-    preds = _filter(preds, symbol, start, end)
+        return []
+    preds = preds[preds["symbol"] == symbol]
     if preds.empty:
-        return {"rows": []}
-    cols = ["symbol","proba_up_1d","signal_1d"] if "symbol" in preds.columns else ["proba_up_1d","signal_1d"]
-    out = preds[cols].tail(limit).reset_index()
-    out["timestamp"] = out["timestamp"].astype("datetime64[ns]").dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT").astype(str)
-    return {"rows": out.to_dict(orient="records")}
+        return []
+    preds = _filter_by_date(preds, start, end)
+
+    out = preds[["timestamp", "symbol", "pred_1d"]].copy()
+    out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return out.to_dict(orient="records")
+
 
 @app.get("/latest")
-def latest(symbol: Optional[str] = Query(None)):
-    df = _join_features()
-    if df.empty:
-        raise HTTPException(status_code=404, detail="No data available.")
-    if symbol and "symbol" in df.columns:
-        df = df[df["symbol"] == symbol]
-        if df.empty:
-            raise HTTPException(status_code=404, detail=f"No data for symbol {symbol}.")
-    row = df.tail(1)
-    payload = row.reset_index().to_dict(orient="records")[0]
-    # stringify timestamp
-    payload["timestamp"] = str(payload["timestamp"])
-    return payload
+def latest(symbol: str = Query(...)):
+    feats = _merge_features()
+    preds = _read_preds()
+
+    row = None
+    if not feats.empty:
+        f = feats[feats["symbol"] == symbol]
+        if not f.empty:
+            row = f.iloc[-1].to_dict()
+
+    if row and not preds.empty:
+        p = preds[preds["symbol"] == symbol]
+        if not p.empty:
+            # align on latest timestamp available in feats
+            ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+            p = p[p["timestamp"] <= ts].sort_values("timestamp").tail(1)
+            if not p.empty:
+                row["pred_1d"] = float(p["pred_1d"].iloc[0])
+
+    # normalize timestamp to string
+    if row and isinstance(row.get("timestamp"), pd.Timestamp):
+        row["timestamp"] = row["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return row or {}
