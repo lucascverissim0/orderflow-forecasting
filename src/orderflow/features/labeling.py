@@ -8,18 +8,30 @@ Labeling: forward returns for multiple horizons.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import pandas as pd
 
 from orderflow.utils.config import get_config
-from orderflow.utils.io import ensure_parent_dir, read_parquet, write_parquet
+from orderflow.utils.io import read_parquet, write_parquet
 
 
-# --- Helpers -----------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Local helper
+# ---------------------------------------------------------------------
+
+def ensure_parent_dir(path: str | Path) -> None:
+    """Ensure the parent directory of `path` exists."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------
+# Labeling logic
+# ---------------------------------------------------------------------
 
 HORIZON_TO_TIMEDelta = {
     "1d": pd.Timedelta(days=1),
     "1w": pd.Timedelta(weeks=1),
-    "1m": pd.Timedelta(days=30),  # simple 30d approximation; OK for MVP
+    "1m": pd.Timedelta(days=30),  # approximate monthly horizon
 }
 
 
@@ -43,38 +55,32 @@ def _forward_return_for_horizon(bars: pd.DataFrame, horizon: str) -> pd.Series:
     df = _ensure_datetime(df, "timestamp")
     df = df.dropna(subset=["timestamp", "symbol", "close"]).sort_values(["symbol", "timestamp"])
 
-    # For each row, we want the close at t+delta for the same symbol.
-    # We'll create a helper frame with timestamp shifted BACK by delta so that a merge_asof aligns.
+    # Create future frame shifted back by delta
     future = df.copy()
-    future["timestamp"] = future["timestamp"] - delta  # so df @ t matches future @ (t+delta - delta) == t
+    future["timestamp"] = future["timestamp"] - delta
     future = future.rename(columns={"close": "close_future"})
 
-    # merge_asof requires sorting by the key and by group; we'll do it per symbol via groupby.apply
-    merged = (
-        pd.merge_asof(
-            df.sort_values("timestamp"),
-            future.sort_values("timestamp"),
-            by="symbol",
-            on="timestamp",
-            direction="forward",  # align df@t with the next available future row (exact after our shift)
-        )
-        .sort_values(["symbol", "timestamp"])
-    )
+    # merge_asof aligns each t with t+delta
+    merged = pd.merge_asof(
+        df.sort_values("timestamp"),
+        future.sort_values("timestamp"),
+        by="symbol",
+        on="timestamp",
+        direction="forward",
+    ).sort_values(["symbol", "timestamp"])
 
     ret = (merged["close_future"] / merged["close"] - 1.0).rename(f"ret_{horizon}")
 
-    # Build a MultiIndex Series on (timestamp, symbol)
+    # MultiIndex Series
     ret.index = pd.MultiIndex.from_frame(merged[["timestamp", "symbol"]], names=["timestamp", "symbol"])
     return ret
 
 
 def compute_labels(bars: pd.DataFrame, horizons: list[str]) -> pd.DataFrame:
-    """
-    Return a DataFrame indexed by (timestamp, symbol) with columns ret_<horizon>.
-    """
+    """Return DataFrame indexed by (timestamp, symbol) with columns ret_<horizon>."""
     series_list = []
     for h in horizons:
-        s = _forward_return_for_horizon(bars, h)  # <-- named Series
+        s = _forward_return_for_horizon(bars, h)
         series_list.append(s)
 
     labels = pd.concat(series_list, axis=1)
@@ -82,7 +88,9 @@ def compute_labels(bars: pd.DataFrame, horizons: list[str]) -> pd.DataFrame:
     return labels
 
 
-# --- CLI entrypoint -----------------------------------------------------------
+# ---------------------------------------------------------------------
+# CLI entrypoint
+# ---------------------------------------------------------------------
 
 def main():
     cfg = get_config()
