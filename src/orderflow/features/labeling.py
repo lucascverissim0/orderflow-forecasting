@@ -1,132 +1,107 @@
 """
-labeling.py
------------
-Computes **forward returns** for multiple horizons (e.g., 1d/1w/1m) from bar data.
-- Uses log returns: ln(C_{t+H} / C_t)
-- Works with hourly or daily bars (configured in `configs/settings.yaml`)
-- Handles single-symbol frames (DatetimeIndex) or multi-symbol frames with a 'symbol' column.
-
-Input:
-  data/interim/bars.parquet  # columns: ['timestamp','symbol','open','high','low','close','volume']
-                             # or index: DatetimeIndex with 'close' (+ optional 'symbol' column)
-
-Output:
-  data/processed/labels.parquet  # columns: ['fwd_ret_1d','fwd_ret_1w','fwd_ret_1m', ...]
+Labeling: forward returns for multiple horizons.
+- Reads bars from data/interim/bars.parquet (expects columns: timestamp, symbol, close)
+- Computes forward returns per horizon (1d/1w/1m) using calendar time deltas
+- Writes data/processed/labels.parquet
 """
 
 from __future__ import annotations
-import math
-from typing import Dict, List
+
+import os
 import pandas as pd
 
 from orderflow.utils.config import get_config
-from orderflow.utils.io import read_parquet, write_parquet
+from orderflow.utils.io import ensure_parent_dir, read_parquet, write_parquet
 
 
-# ---------- Helpers ----------
+# --- Helpers -----------------------------------------------------------------
 
-def _horizon_periods(freq: str, horizon: str) -> int:
+HORIZON_TO_TIMEDelta = {
+    "1d": pd.Timedelta(days=1),
+    "1w": pd.Timedelta(weeks=1),
+    "1m": pd.Timedelta(days=30),  # simple 30d approximation; OK for MVP
+}
+
+
+def _ensure_datetime(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
+    if not pd.api.types.is_datetime64_any_dtype(df[col]):
+        df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    return df
+
+
+def _forward_return_for_horizon(bars: pd.DataFrame, horizon: str) -> pd.Series:
     """
-    Map a human horizon ('1d','1w','1m') to a number of bars given the pipeline frequency.
-    This assumes regular bars (hourly/daily). For trading vs calendar days, we choose calendar-based
-    approximations which are robust for swing horizons:
-      - 1d = 1 day
-      - 1w = 7 days
-      - 1m = 30 days
+    Compute forward return for one horizon as a named Series indexed by (timestamp, symbol).
+    ret_h = close(t + horizon) / close(t) - 1
     """
-    freq = freq.lower()
-    if freq not in {"1h", "1d"}:
-        raise ValueError(f"Unsupported frequency '{freq}'. Use '1h' or '1d'.")
+    if horizon not in HORIZON_TO_TIMEDelta:
+        raise ValueError(f"Unknown horizon '{horizon}'. Expected one of {list(HORIZON_TO_TIMEDelta)}")
 
-    day_bars = 24 if freq == "1h" else 1
+    delta = HORIZON_TO_TIMEDelta[horizon]
 
-    if horizon == "1d":
-        return day_bars * 1
-    if horizon == "1w":
-        return day_bars * 7
-    if horizon == "1m":
-        return day_bars * 30
+    df = bars[["timestamp", "symbol", "close"]].copy()
+    df = _ensure_datetime(df, "timestamp")
+    df = df.dropna(subset=["timestamp", "symbol", "close"]).sort_values(["symbol", "timestamp"])
 
-    # Accept numeric suffix like '3d', '2w', '6m'
-    unit = horizon[-1].lower()
-    val = int(horizon[:-1])
-    if unit == "d":
-        return day_bars * val
-    if unit == "w":
-        return day_bars * (7 * val)
-    if unit == "m":
-        return day_bars * (30 * val)
+    # For each row, we want the close at t+delta for the same symbol.
+    # We'll create a helper frame with timestamp shifted BACK by delta so that a merge_asof aligns.
+    future = df.copy()
+    future["timestamp"] = future["timestamp"] - delta  # so df @ t matches future @ (t+delta - delta) == t
+    future = future.rename(columns={"close": "close_future"})
 
-    raise ValueError(f"Unrecognized horizon format: {horizon}")
+    # merge_asof requires sorting by the key and by group; we'll do it per symbol via groupby.apply
+    merged = (
+        pd.merge_asof(
+            df.sort_values("timestamp"),
+            future.sort_values("timestamp"),
+            by="symbol",
+            on="timestamp",
+            direction="forward",  # align df@t with the next available future row (exact after our shift)
+        )
+        .sort_values(["symbol", "timestamp"])
+    )
+
+    ret = (merged["close_future"] / merged["close"] - 1.0).rename(f"ret_{horizon}")
+
+    # Build a MultiIndex Series on (timestamp, symbol)
+    ret.index = pd.MultiIndex.from_frame(merged[["timestamp", "symbol"]], names=["timestamp", "symbol"])
+    return ret
 
 
-def _forward_log_return(close: pd.Series, periods: int) -> pd.Series:
+def compute_labels(bars: pd.DataFrame, horizons: list[str]) -> pd.DataFrame:
     """
-    Compute forward log return over 'periods' bars:
-      ln(close.shift(-periods) / close)
+    Return a DataFrame indexed by (timestamp, symbol) with columns ret_<horizon>.
     """
-    future = close.shift(-periods)
-    return (future / close).apply(lambda x: math.log(x) if pd.notna(x) and x > 0 else pd.NA)
+    series_list = []
+    for h in horizons:
+        s = _forward_return_for_horizon(bars, h)  # <-- named Series
+        series_list.append(s)
+
+    labels = pd.concat(series_list, axis=1)
+    labels = labels.sort_index()
+    return labels
 
 
-def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
-    if "timestamp" in df.columns:
-        df = df.set_index("timestamp")
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("Bars must have a DatetimeIndex or a 'timestamp' column.")
-    return df.sort_index()
-
-
-# ---------- Main ----------
-
-def compute_labels(bars: pd.DataFrame, horizons: List[str], freq: str) -> pd.DataFrame:
-    """
-    Returns a DataFrame with forward-return columns for each horizon.
-    Preserves a 'symbol' column if present; otherwise labels apply to the single series.
-    """
-    bars = _ensure_datetime_index(bars)
-
-    label_cols: Dict[str, pd.Series] = {}
-
-    if "symbol" in bars.columns:
-        labels_list = []
-        for sym, g in bars.groupby("symbol", sort=False):
-            g = g.sort_index()
-            for hz in horizons:
-                p = _horizon_periods(freq, hz)
-                colname = f"fwd_ret_{hz}"
-                labels_list.append(
-                    _forward_log_return(g["close"], p).rename(colname).to_frame().assign(symbol=sym)
-                )
-        labels = pd.concat(labels_list).sort_index()
-        # Pivot multiple horizons into columns (keeping symbol column)
-        labels = labels.pivot_table(index=["timestamp", "symbol"], values=list({s.name for s in labels_list}), aggfunc="first")
-        labels = labels.reset_index()
-        labels = labels.set_index("timestamp")
-        return labels
-    else:
-        for hz in horizons:
-            p = _horizon_periods(freq, hz)
-            label_cols[f"fwd_ret_{hz}"] = _forward_log_return(bars["close"], p)
-
-        labels = pd.DataFrame(label_cols, index=bars.index)
-        return labels
-
+# --- CLI entrypoint -----------------------------------------------------------
 
 def main():
     cfg = get_config()
-    horizons = cfg.horizons
-    freq = cfg.frequency
 
-    # Load bars
-    bars = read_parquet("data/interim/bars.parquet")
+    bars_path = os.path.join("data", "interim", "bars.parquet")
+    out_path = os.path.join("data", "processed", "labels.parquet")
+    ensure_parent_dir(out_path)
 
-    # Compute labels
-    labels = compute_labels(bars, horizons=horizons, freq=freq)
+    if not os.path.exists(bars_path):
+        raise FileNotFoundError(f"{bars_path} not found. Run scripts/make_demo_data.py first.")
 
-    # Write out
-    write_parquet(labels, "data/processed/labels.parquet")
-    print(f"Wrote labels for horizons {horizons} to data/processed/labels.parquet")
+    bars = read_parquet(bars_path)
+    bars = _ensure_datetime(bars, "timestamp")
+
+    horizons = cfg.get("horizons", ["1d", "1w", "1m"])
+    labels = compute_labels(bars, horizons=horizons)
+
+    write_parquet(labels.reset_index(), out_path)
+    print(f"Wrote labels to {out_path}")
 
 
 if __name__ == "__main__":
