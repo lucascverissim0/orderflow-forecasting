@@ -3,14 +3,14 @@ FastAPI backend for the orderflow-forecasting MVP (batch).
 
 Endpoints
 - GET /health
-- GET /symbols                     -> ["BTC-USD", "ETH-USD", ...]
+- GET /symbols                     -> ["BTC-USD", "ETH-USD", ...]  (plain list)
 - GET /timeseries?symbol=&start=&end=
 - GET /predictions?symbol=&start=&end=
 - GET /latest?symbol=
 
 Notes
 - CORS is permissive for local/Codespaces dev. Lock down for prod.
-- All file reads are resilient; empty/missing inputs return [].
+- All file reads are resilient; empty/missing inputs return [] / {}.
 """
 
 from __future__ import annotations
@@ -33,14 +33,14 @@ app = FastAPI(title="orderflow-forecasting API", version="0.1.0")
 # ---- Dev CORS (broad; tighten for prod) -------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # ok for dev; prefer your specific frontend origin(s) in prod
+    allow_origins=["*"],  # ok for dev; prefer specific frontend origin(s) in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 # ---- Helpers ----------------------------------------------------------------
+
 
 def _ensure_dt(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
     if col in df.columns and not pd.api.types.is_datetime64_any_dtype(df[col]):
@@ -58,6 +58,7 @@ def _normalize_keys(df: pd.DataFrame) -> pd.DataFrame:
                 if alt in df.columns:
                     df = df.rename(columns={alt: "timestamp"})
                     break
+
     if "symbol" not in df.columns:
         if isinstance(df.index, pd.MultiIndex) and "symbol" in df.index.names:
             df = df.reset_index()
@@ -66,6 +67,7 @@ def _normalize_keys(df: pd.DataFrame) -> pd.DataFrame:
                 if alt in df.columns:
                     df = df.rename(columns={alt: "symbol"})
                     break
+
     return df
 
 
@@ -102,11 +104,14 @@ def _read_preds() -> pd.DataFrame:
 def _merge_features() -> pd.DataFrame:
     micro = _read_micro()
     opts = _read_options_features()
+
     if micro.empty:
         return micro
+
     if not opts.empty:
         df = pd.merge(
-            micro, opts,
+            micro,
+            opts,
             on=["timestamp", "symbol"],
             how="left",
             suffixes=("", "_opt"),
@@ -114,12 +119,15 @@ def _merge_features() -> pd.DataFrame:
         )
     else:
         df = micro
+
     if {"symbol", "timestamp"} <= set(df.columns):
         df = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
     return df
 
 
-def _filter_by_date(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
+def _filter_by_date(
+    df: pd.DataFrame, start: Optional[str], end: Optional[str]
+) -> pd.DataFrame:
     if start:
         df = df[df["timestamp"] >= pd.to_datetime(start, utc=True, errors="coerce")]
     if end:
@@ -129,14 +137,19 @@ def _filter_by_date(df: pd.DataFrame, start: Optional[str], end: Optional[str]) 
 
 # ---- Routes -----------------------------------------------------------------
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.get("/symbols")
+@app.get("/symbols", response_model=List[str])
 def symbols() -> List[str]:
-    """Return a plain list so the UI dropdown populates."""
+    """
+    Return a plain list so the UI dropdown populates cleanly.
+
+    Uses config.symbols from configs/settings.yaml via get_config().
+    """
     cfg = get_config()
     syms = list(getattr(cfg, "symbols", [])) or []
     return syms
@@ -151,18 +164,29 @@ def timeseries(
     df = _merge_features()
     if df.empty:
         return []
+
     df = df[df["symbol"] == symbol]
     if df.empty:
         return []
+
     df = _filter_by_date(df, start, end)
 
     # Keep a small, UI-friendly set of columns if present
     cols = ["timestamp", "symbol", "close", "volume", "cvd", "pcr", "at_ask_bias"]
     present = [c for c in cols if c in df.columns]
+    if not present:
+        return []
+
     out = df[present].copy()
 
     # Convert timestamp to ISO strings for JSON
-    out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if pd.api.types.is_datetime64_any_dtype(out["timestamp"]):
+        out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        out["timestamp"] = pd.to_datetime(
+            out["timestamp"], utc=True, errors="coerce"
+        ).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     return out.to_dict(orient="records")
 
 
@@ -175,13 +199,22 @@ def predictions(
     preds = _read_preds()
     if preds.empty:
         return []
+
     preds = preds[preds["symbol"] == symbol]
     if preds.empty:
         return []
+
     preds = _filter_by_date(preds, start, end)
 
     out = preds[["timestamp", "symbol", "pred_1d"]].copy()
-    out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if pd.api.types.is_datetime64_any_dtype(out["timestamp"]):
+        out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        out["timestamp"] = pd.to_datetime(
+            out["timestamp"], utc=True, errors="coerce"
+        ).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     return out.to_dict(orient="records")
 
 
