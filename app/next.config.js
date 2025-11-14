@@ -1,17 +1,16 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = {
-  reactStrictMode: true,
-  swcMinify: true,
 
-  // In development, allow CORS requests to FastAPI (port 8000)
+const API_URL = "https://redesigned-funicular-r4v4jrrxxq67fpr47-8000.app.github.dev";
+
+const nextConfig = {
   async rewrites() {
     return [
       {
         source: "/api/:path*",
-        destination: "http://localhost:8000/:path*"
-      }
+        destination: `${API_URL}/:path*`,
+      },
     ];
-  }
+  },
 };
 
 module.exports = nextConfig;
