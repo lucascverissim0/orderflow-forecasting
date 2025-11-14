@@ -1,10 +1,8 @@
 import { useEffect, useState } from "react";
 
-const API_URL = "https://redesigned-funicular-r4v4jrrxxq67fpr47-8000.app.github.dev";
-
 type SymbolId = string;
 
-interface Row {
+interface TimeRow {
   timestamp: string;
   symbol: string;
   close?: number;
@@ -12,24 +10,36 @@ interface Row {
   cvd?: number;
   pcr?: number;
   at_ask_bias?: number;
+}
+
+interface PredRow {
+  timestamp: string;
+  symbol: string;
+  pred_1d: number;
+}
+
+interface LatestRow {
+  [key: string]: any;
+  timestamp?: string;
+  symbol?: string;
   pred_1d?: number;
 }
 
 export default function HomePage() {
   const [symbols, setSymbols] = useState<SymbolId[]>([]);
   const [symbol, setSymbol] = useState<SymbolId>("");
-  const [rows, setRows] = useState<Row[]>([]);
-  const [latest, setLatest] = useState<Row | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [rows, setRows] = useState<(TimeRow & { pred_1d?: number })[]>([]);
+  const [latest, setLatest] = useState<LatestRow | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // ---- fetch helpers --------------------------------------------------------
+  // ---- helpers -------------------------------------------------------------
 
-  async function loadSymbols() {
+  async function fetchSymbols() {
     try {
       setError(null);
-      const res = await fetch(`${API_URL}/symbols`);
-      if (!res.ok) throw new Error(`GET /symbols -> ${res.status}`);
+      const res = await fetch("/api/symbols");
+      if (!res.ok) throw new Error(`GET /api/symbols -> ${res.status}`);
       const data: string[] = await res.json();
       setSymbols(data);
       if (data.length && !symbol) setSymbol(data[0]);
@@ -39,31 +49,32 @@ export default function HomePage() {
     }
   }
 
-  async function loadData() {
+  async function fetchData() {
     if (!symbol) return;
     try {
       setLoading(true);
       setError(null);
 
       const [tsRes, predRes, latestRes] = await Promise.all([
-        fetch(`${API_URL}/timeseries?symbol=${encodeURIComponent(symbol)}`),
-        fetch(`${API_URL}/predictions?symbol=${encodeURIComponent(symbol)}`),
-        fetch(`${API_URL}/latest?symbol=${encodeURIComponent(symbol)}`),
+        fetch(`/api/timeseries?symbol=${encodeURIComponent(symbol)}`),
+        fetch(`/api/predictions?symbol=${encodeURIComponent(symbol)}`),
+        fetch(`/api/latest?symbol=${encodeURIComponent(symbol)}`),
       ]);
 
-      if (!tsRes.ok) throw new Error(`GET /timeseries -> ${tsRes.status}`);
-      if (!predRes.ok) throw new Error(`GET /predictions -> ${predRes.status}`);
-      if (!latestRes.ok) throw new Error(`GET /latest -> ${latestRes.status}`);
+      if (!tsRes.ok) throw new Error(`GET /api/timeseries -> ${tsRes.status}`);
+      if (!predRes.ok)
+        throw new Error(`GET /api/predictions -> ${predRes.status}`);
+      if (!latestRes.ok)
+        throw new Error(`GET /api/latest -> ${latestRes.status}`);
 
-      const tsData: Row[] = await tsRes.json();
-      const predData: { timestamp: string; pred_1d: number }[] =
-        await predRes.json();
-      const latestData: any = await latestRes.json();
+      const tsData: TimeRow[] = await tsRes.json();
+      const predData: PredRow[] = await predRes.json();
+      const latestData: LatestRow = await latestRes.json();
 
-      // merge preds into ts rows by timestamp
       const predByTs = new Map(
         predData.map((p) => [p.timestamp, p.pred_1d] as [string, number])
       );
+
       const merged = tsData.map((r) => ({
         ...r,
         pred_1d: predByTs.get(r.timestamp),
@@ -81,21 +92,21 @@ export default function HomePage() {
     }
   }
 
-  // ---- effects --------------------------------------------------------------
+  // ---- effects -------------------------------------------------------------
 
   useEffect(() => {
-    loadSymbols();
+    fetchSymbols();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     if (symbol) {
-      loadData();
+      fetchData();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol]);
 
-  // ---- UI -------------------------------------------------------------------
+  // ---- UI ------------------------------------------------------------------
 
   return (
     <main style={{ padding: "24px", fontFamily: "system-ui, sans-serif" }}>
@@ -123,20 +134,12 @@ export default function HomePage() {
           ))}
         </select>
 
-        {/* Dummy date pickers (not wired for now) */}
-        <input
-          type="date"
-          style={{ padding: "4px 8px" }}
-          aria-label="start date"
-        />
-        <input
-          type="date"
-          style={{ padding: "4px 8px" }}
-          aria-label="end date"
-        />
+        {/* Dummy dates */}
+        <input type="date" style={{ padding: "4px 8px" }} />
+        <input type="date" style={{ padding: "4px 8px" }} />
 
         <button
-          onClick={loadData}
+          onClick={fetchData}
           disabled={!symbol || loading}
           style={{ padding: "4px 12px" }}
         >
@@ -201,8 +204,7 @@ export default function HomePage() {
             marginBottom: "8px",
           }}
         >
-          Timestamp (UTC) | Close | Volume | CVD | PCR | At-Ask Bias | Proba Up
-          (1d)
+          Timestamp (UTC) | Close | Volume | CVD | PCR | At-Ask Bias | Pred 1d
         </h3>
         <table
           style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}
