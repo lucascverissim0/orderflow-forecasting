@@ -2,8 +2,9 @@
 FastAPI backend for the orderflow-forecasting MVP (batch).
 
 Endpoints
+- GET /                  -> HTML dashboard (simple JS UI)
 - GET /health
-- GET /symbols                     -> ["BTC-USD", "ETH-USD", ...]  (plain list)
+- GET /symbols                     -> ["BTC-USD", "ETH-USD", ...]
 - GET /timeseries?symbol=&start=&end=
 - GET /predictions?symbol=&start=&end=
 - GET /latest?symbol=
@@ -19,8 +20,9 @@ from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 from orderflow.utils.config import get_config
 from orderflow.utils.io import read_parquet
@@ -38,6 +40,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ---- Helpers ----------------------------------------------------------------
 
@@ -135,21 +138,242 @@ def _filter_by_date(
     return df
 
 
-# ---- Routes -----------------------------------------------------------------
+# ---- Simple HTML dashboard --------------------------------------------------
+
+
+@app.get("/", response_class=HTMLResponse)
+def root_page():
+    """Serve a minimal HTML+JS dashboard that talks to this API."""
+    # NOTE: all fetch() calls are relative (same origin), so no CORS/env pain.
+    return """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Orderflow Forecasting (Batch)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+           background: #0f172a; color: #e5e7eb; margin: 0; padding: 24px; }
+    h1 { font-size: 26px; margin-bottom: 4px; }
+    h2 { font-size: 18px; margin-top: 24px; margin-bottom: 8px; }
+    p { margin: 4px 0 8px 0; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+    select, input[type="date"], button {
+      padding: 4px 8px; border-radius: 4px; border: 1px solid #374151;
+      background: #020617; color: inherit;
+    }
+    button { cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .card { border: 1px solid #1f2937; border-radius: 8px; padding: 12px; margin-top: 8px; background: #020617; }
+    table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 8px; }
+    th, td { border-bottom: 1px solid #1f2937; padding: 4px 6px; text-align: left; }
+    th { font-weight: 600; color: #9ca3af; }
+    .error { border-color: #fca5a5; background: #450a0a; color: #fecaca; }
+    .status { font-size: 12px; color: #9ca3af; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Orderflow Forecasting (Batch)</h1>
+  <p>Select a symbol and time window, then press <b>Refresh</b>. Data comes from your batch pipeline.</p>
+
+  <div class="controls">
+    <select id="symbol"></select>
+    <input type="date" id="start" />
+    <input type="date" id="end" />
+    <button id="refresh">Refresh</button>
+  </div>
+
+  <div id="error" class="card error" style="display:none;"></div>
+
+  <h2>Latest snapshot</h2>
+  <div id="latest" class="card">
+    <p>No data yet. Try Refresh after running the pipeline.</p>
+  </div>
+
+  <h2>Timeseries + 1d predictions</h2>
+  <div class="card">
+    <table id="table">
+      <thead>
+        <tr>
+          <th>Timestamp (UTC)</th>
+          <th>Close</th>
+          <th>Volume</th>
+          <th>CVD</th>
+          <th>PCR</th>
+          <th>At-Ask Bias</th>
+          <th>Pred 1d</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="7">No rows to display.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <script>
+    const symbolEl = document.getElementById("symbol");
+    const startEl = document.getElementById("start");
+    const endEl = document.getElementById("end");
+    const refreshBtn = document.getElementById("refresh");
+    const errorEl = document.getElementById("error");
+    const latestEl = document.getElementById("latest");
+    const tbodyEl = document.getElementById("tbody");
+    const statusEl = document.getElementById("status");
+
+    function showError(msg) {
+      errorEl.textContent = msg;
+      errorEl.style.display = "block";
+    }
+
+    function clearError() {
+      errorEl.style.display = "none";
+      errorEl.textContent = "";
+    }
+
+    async function fetchJSON(path) {
+      const res = await fetch(path);
+      if (!res.ok) {
+        throw new Error(path + " -> " + res.status);
+      }
+      return res.json();
+    }
+
+    async function loadSymbols() {
+      try {
+        clearError();
+        const syms = await fetchJSON("/symbols");
+        symbolEl.innerHTML = "";
+        if (!syms || syms.length === 0) {
+          const opt = document.createElement("option");
+          opt.value = "";
+          opt.textContent = "No symbols";
+          symbolEl.appendChild(opt);
+          refreshBtn.disabled = true;
+          statusEl.textContent = "No symbols from backend.";
+          return;
+        }
+        syms.forEach(s => {
+          const opt = document.createElement("option");
+          opt.value = s;
+          opt.textContent = s;
+          symbolEl.appendChild(opt);
+        });
+        refreshBtn.disabled = false;
+        statusEl.textContent = "Loaded " + syms.length + " symbols.";
+      } catch (err) {
+        console.error(err);
+        showError(err.message || "Failed to fetch symbols");
+      }
+    }
+
+    async function loadData() {
+      const sym = symbolEl.value;
+      if (!sym) return;
+      clearError();
+      statusEl.textContent = "Loading data for " + sym + "...";
+
+      const params = new URLSearchParams();
+      params.set("symbol", sym);
+      if (startEl.value) params.set("start", startEl.value);
+      if (endEl.value) params.set("end", endEl.value);
+
+      try {
+        const [ts, preds, latest] = await Promise.all([
+          fetchJSON("/timeseries?" + params.toString()),
+          fetchJSON("/predictions?" + params.toString()),
+          fetchJSON("/latest?symbol=" + encodeURIComponent(sym)),
+        ]);
+
+        // merge preds into timeseries by timestamp
+        const predByTs = new Map();
+        (preds || []).forEach(p => predByTs.set(p.timestamp, p.pred_1d));
+
+        // update table
+        tbodyEl.innerHTML = "";
+        const rows = ts || [];
+        if (rows.length === 0) {
+          const tr = document.createElement("tr");
+          const td = document.createElement("td");
+          td.colSpan = 7;
+          td.textContent = "No rows to display.";
+          tr.appendChild(td);
+          tbodyEl.appendChild(tr);
+        } else {
+          rows.forEach(r => {
+            const tr = document.createElement("tr");
+            const cells = [
+              r.timestamp,
+              r.close ?? "-",
+              r.volume ?? "-",
+              r.cvd ?? "-",
+              r.pcr ?? "-",
+              r.at_ask_bias ?? "-",
+              predByTs.get(r.timestamp) ?? "-"
+            ];
+            cells.forEach(val => {
+              const td = document.createElement("td");
+              td.textContent = val;
+              tr.appendChild(td);
+            });
+            tbodyEl.appendChild(tr);
+          });
+        }
+
+        // update latest card
+        latestEl.innerHTML = "";
+        if (!latest || !latest.timestamp) {
+          latestEl.innerHTML = "<p>No data yet. Try Refresh after running the pipeline.</p>";
+        } else {
+          const fields = [
+            ["Time", latest.timestamp],
+            ["Close", latest.close],
+            ["Volume", latest.volume],
+            ["CVD", latest.cvd],
+            ["PCR", latest.pcr],
+            ["At-Ask Bias", latest.at_ask_bias],
+            ["Pred 1d", latest.pred_1d],
+          ];
+          fields.forEach(([label, value]) => {
+            if (value === undefined || value === null) return;
+            const p = document.createElement("p");
+            p.innerHTML = "<b>" + label + ":</b> " + value;
+            latestEl.appendChild(p);
+          });
+        }
+
+        statusEl.textContent = "Loaded " + rows.length + " rows for " + sym + ".";
+      } catch (err) {
+        console.error(err);
+        showError(err.message || "Failed to fetch data");
+        statusEl.textContent = "";
+      }
+    }
+
+    refreshBtn.addEventListener("click", loadData);
+    symbolEl.addEventListener("change", loadData);
+
+    // initial load
+    loadSymbols().then(loadData).catch(console.error);
+  </script>
+</body>
+</html>
+    """
+
+
+# ---- JSON Routes ------------------------------------------------------------
 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    cfg = get_config()
+    syms = list(getattr(cfg, "symbols", [])) or []
+    return {"status": "ok", "symbols": syms, "frequency": "1h"}
 
 
 @app.get("/symbols", response_model=List[str])
 def symbols() -> List[str]:
-    """
-    Return a plain list so the UI dropdown populates cleanly.
-
-    Uses config.symbols from configs/settings.yaml via get_config().
-    """
     cfg = get_config()
     syms = list(getattr(cfg, "symbols", [])) or []
     return syms
@@ -171,22 +395,18 @@ def timeseries(
 
     df = _filter_by_date(df, start, end)
 
-    # Keep a small, UI-friendly set of columns if present
     cols = ["timestamp", "symbol", "close", "volume", "cvd", "pcr", "at_ask_bias"]
     present = [c for c in cols if c in df.columns]
     if not present:
         return []
 
     out = df[present].copy()
-
-    # Convert timestamp to ISO strings for JSON
     if pd.api.types.is_datetime64_any_dtype(out["timestamp"]):
         out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     else:
         out["timestamp"] = pd.to_datetime(
             out["timestamp"], utc=True, errors="coerce"
         ).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     return out.to_dict(orient="records")
 
 
@@ -207,14 +427,12 @@ def predictions(
     preds = _filter_by_date(preds, start, end)
 
     out = preds[["timestamp", "symbol", "pred_1d"]].copy()
-
     if pd.api.types.is_datetime64_any_dtype(out["timestamp"]):
         out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     else:
         out["timestamp"] = pd.to_datetime(
             out["timestamp"], utc=True, errors="coerce"
         ).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     return out.to_dict(orient="records")
 
 
@@ -232,13 +450,11 @@ def latest(symbol: str = Query(...)):
     if row and not preds.empty:
         p = preds[preds["symbol"] == symbol]
         if not p.empty:
-            # align on latest timestamp available in feats
             ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
             p = p[p["timestamp"] <= ts].sort_values("timestamp").tail(1)
             if not p.empty:
                 row["pred_1d"] = float(p["pred_1d"].iloc[0])
 
-    # normalize timestamp to string
     if row and isinstance(row.get("timestamp"), pd.Timestamp):
         row["timestamp"] = row["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
 
