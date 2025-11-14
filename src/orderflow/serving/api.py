@@ -1,17 +1,5 @@
 """
 Minimal FastAPI backend + HTML dashboard for orderflow-forecasting (batch).
-
-JSON endpoints
-- GET /health
-- GET /symbols
-- GET /timeseries?symbol=&start=&end=
-- GET /predictions?symbol=&start=&end=
-- GET /latest?symbol=
-
-HTML dashboard
-- GET /      -> simple page using fetch() to call the JSON endpoints
-
-This completely avoids Next.js/env var/CORS headaches for the MVP.
 """
 
 from __future__ import annotations
@@ -31,7 +19,6 @@ DATA_PROCESSED = Path("data/processed")
 
 app = FastAPI(title="orderflow-forecasting API", version="0.1.0")
 
-# For dev only – safe because everything is same-origin in practice.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------------------------------------------------- helpers
+# ---------- helpers ----------------------------------------------------------
 
 
 def _ensure_dt(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
@@ -50,7 +37,6 @@ def _ensure_dt(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
 
 
 def _normalize_keys(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure 'timestamp' and 'symbol' are normal columns."""
     if "timestamp" not in df.columns:
         if isinstance(df.index, pd.DatetimeIndex):
             df = df.reset_index().rename(columns={"index": "timestamp"})
@@ -133,12 +119,11 @@ def _filter_by_date(
     return df
 
 
-# --------------------------------------------------------------------- HTML UI
+# ---------- HTML dashboard ---------------------------------------------------
 
 
 @app.get("/", response_class=HTMLResponse)
 def root_page():
-    """Very simple dashboard in plain HTML+JS. No Next.js, no env vars."""
     return """
 <!doctype html>
 <html lang="en">
@@ -169,7 +154,7 @@ def root_page():
 </head>
 <body>
   <h1>Orderflow Forecasting (Batch)</h1>
-  <p>Minimal dashboard served directly by FastAPI. No Next.js.</p>
+  <p>Minimal dashboard served directly by FastAPI.</p>
 
   <div class="controls">
     <label>
@@ -220,12 +205,10 @@ def root_page():
       errorEl.textContent = msg;
       errorEl.style.display = "block";
     }
-
     function clearError() {
       errorEl.style.display = "none";
       errorEl.textContent = "";
     }
-
     async function fetchJSON(path) {
       const res = await fetch(path);
       if (!res.ok) throw new Error(path + " -> " + res.status);
@@ -275,11 +258,9 @@ def root_page():
           fetchJSON("/latest?symbol=" + encodeURIComponent(sym)),
         ]);
 
-        // merge preds into ts rows by timestamp
         const predByTs = new Map();
         (preds || []).forEach(p => predByTs.set(p.timestamp, p.pred_1d));
 
-        // update table
         tbodyEl.innerHTML = "";
         const rows = ts || [];
         if (rows.length === 0) {
@@ -310,7 +291,6 @@ def root_page():
           });
         }
 
-        // update latest card
         latestEl.innerHTML = "";
         if (!latest || !latest.timestamp) {
           latestEl.innerHTML = "<p>No data yet. Try Refresh after running the pipeline.</p>";
@@ -343,7 +323,6 @@ def root_page():
     refreshBtn.addEventListener("click", loadData);
     symbolEl.addEventListener("change", loadData);
 
-    // initial load
     loadSymbols().then(loadData).catch(console.error);
   </script>
 </body>
@@ -351,7 +330,7 @@ def root_page():
     """
 
 
-# --------------------------------------------------------------------- JSON API
+# ---------- JSON endpoints ---------------------------------------------------
 
 
 @app.get("/health")
