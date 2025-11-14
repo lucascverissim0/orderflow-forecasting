@@ -1,17 +1,17 @@
 """
-FastAPI backend for the orderflow-forecasting MVP (batch).
+Minimal FastAPI backend + HTML dashboard for orderflow-forecasting (batch).
 
-Endpoints
-- GET /                  -> HTML dashboard (simple JS UI)
+JSON endpoints
 - GET /health
-- GET /symbols                     -> ["BTC-USD", "ETH-USD", ...]
+- GET /symbols
 - GET /timeseries?symbol=&start=&end=
 - GET /predictions?symbol=&start=&end=
 - GET /latest?symbol=
 
-Notes
-- CORS is permissive for local/Codespaces dev. Lock down for prod.
-- All file reads are resilient; empty/missing inputs return [] / {}.
+HTML dashboard
+- GET /      -> simple page using fetch() to call the JSON endpoints
+
+This completely avoids Next.js/env var/CORS headaches for the MVP.
 """
 
 from __future__ import annotations
@@ -27,22 +27,20 @@ from fastapi.responses import HTMLResponse
 from orderflow.utils.config import get_config
 from orderflow.utils.io import read_parquet
 
-DATA_INTERIM = Path("data/interim")
 DATA_PROCESSED = Path("data/processed")
 
 app = FastAPI(title="orderflow-forecasting API", version="0.1.0")
 
-# ---- Dev CORS (broad; tighten for prod) -------------------------------------
+# For dev only – safe because everything is same-origin in practice.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ok for dev; prefer specific frontend origin(s) in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ---- Helpers ----------------------------------------------------------------
+# --------------------------------------------------------------------- helpers
 
 
 def _ensure_dt(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
@@ -107,10 +105,8 @@ def _read_preds() -> pd.DataFrame:
 def _merge_features() -> pd.DataFrame:
     micro = _read_micro()
     opts = _read_options_features()
-
     if micro.empty:
         return micro
-
     if not opts.empty:
         df = pd.merge(
             micro,
@@ -122,7 +118,6 @@ def _merge_features() -> pd.DataFrame:
         )
     else:
         df = micro
-
     if {"symbol", "timestamp"} <= set(df.columns):
         df = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
     return df
@@ -138,13 +133,12 @@ def _filter_by_date(
     return df
 
 
-# ---- Simple HTML dashboard --------------------------------------------------
+# --------------------------------------------------------------------- HTML UI
 
 
 @app.get("/", response_class=HTMLResponse)
 def root_page():
-    """Serve a minimal HTML+JS dashboard that talks to this API."""
-    # NOTE: all fetch() calls are relative (same origin), so no CORS/env pain.
+    """Very simple dashboard in plain HTML+JS. No Next.js, no env vars."""
     return """
 <!doctype html>
 <html lang="en">
@@ -158,13 +152,14 @@ def root_page():
     h2 { font-size: 18px; margin-top: 24px; margin-bottom: 8px; }
     p { margin: 4px 0 8px 0; }
     .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
-    select, input[type="date"], button {
+    select, button {
       padding: 4px 8px; border-radius: 4px; border: 1px solid #374151;
       background: #020617; color: inherit;
     }
     button { cursor: pointer; }
     button:disabled { opacity: 0.5; cursor: default; }
-    .card { border: 1px solid #1f2937; border-radius: 8px; padding: 12px; margin-top: 8px; background: #020617; }
+    .card { border: 1px solid #1f2937; border-radius: 8px; padding: 12px;
+            margin-top: 8px; background: #020617; }
     table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 8px; }
     th, td { border-bottom: 1px solid #1f2937; padding: 4px 6px; text-align: left; }
     th { font-weight: 600; color: #9ca3af; }
@@ -174,12 +169,13 @@ def root_page():
 </head>
 <body>
   <h1>Orderflow Forecasting (Batch)</h1>
-  <p>Select a symbol and time window, then press <b>Refresh</b>. Data comes from your batch pipeline.</p>
+  <p>Minimal dashboard served directly by FastAPI. No Next.js.</p>
 
   <div class="controls">
-    <select id="symbol"></select>
-    <input type="date" id="start" />
-    <input type="date" id="end" />
+    <label>
+      Symbol
+      <select id="symbol"></select>
+    </label>
     <button id="refresh">Refresh</button>
   </div>
 
@@ -192,7 +188,7 @@ def root_page():
 
   <h2>Timeseries + 1d predictions</h2>
   <div class="card">
-    <table id="table">
+    <table>
       <thead>
         <tr>
           <th>Timestamp (UTC)</th>
@@ -214,8 +210,6 @@ def root_page():
 
   <script>
     const symbolEl = document.getElementById("symbol");
-    const startEl = document.getElementById("start");
-    const endEl = document.getElementById("end");
     const refreshBtn = document.getElementById("refresh");
     const errorEl = document.getElementById("error");
     const latestEl = document.getElementById("latest");
@@ -234,9 +228,7 @@ def root_page():
 
     async function fetchJSON(path) {
       const res = await fetch(path);
-      if (!res.ok) {
-        throw new Error(path + " -> " + res.status);
-      }
+      if (!res.ok) throw new Error(path + " -> " + res.status);
       return res.json();
     }
 
@@ -274,10 +266,7 @@ def root_page():
       clearError();
       statusEl.textContent = "Loading data for " + sym + "...";
 
-      const params = new URLSearchParams();
-      params.set("symbol", sym);
-      if (startEl.value) params.set("start", startEl.value);
-      if (endEl.value) params.set("end", endEl.value);
+      const params = new URLSearchParams({ symbol: sym });
 
       try {
         const [ts, preds, latest] = await Promise.all([
@@ -286,7 +275,7 @@ def root_page():
           fetchJSON("/latest?symbol=" + encodeURIComponent(sym)),
         ]);
 
-        // merge preds into timeseries by timestamp
+        // merge preds into ts rows by timestamp
         const predByTs = new Map();
         (preds || []).forEach(p => predByTs.set(p.timestamp, p.pred_1d));
 
@@ -362,14 +351,14 @@ def root_page():
     """
 
 
-# ---- JSON Routes ------------------------------------------------------------
+# --------------------------------------------------------------------- JSON API
 
 
 @app.get("/health")
 def health():
     cfg = get_config()
     syms = list(getattr(cfg, "symbols", [])) or []
-    return {"status": "ok", "symbols": syms, "frequency": "1h"}
+    return {"status": "ok", "symbols": syms}
 
 
 @app.get("/symbols", response_model=List[str])
@@ -381,18 +370,16 @@ def symbols() -> List[str]:
 
 @app.get("/timeseries")
 def timeseries(
-    symbol: str = Query(..., description="Symbol as in your config"),
-    start: Optional[str] = Query(None, description="ISO date/time"),
-    end: Optional[str] = Query(None, description="ISO date/time"),
+    symbol: str = Query(...),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
 ):
     df = _merge_features()
     if df.empty:
         return []
-
     df = df[df["symbol"] == symbol]
     if df.empty:
         return []
-
     df = _filter_by_date(df, start, end)
 
     cols = ["timestamp", "symbol", "close", "volume", "cvd", "pcr", "at_ask_bias"]
@@ -419,11 +406,9 @@ def predictions(
     preds = _read_preds()
     if preds.empty:
         return []
-
     preds = preds[preds["symbol"] == symbol]
     if preds.empty:
         return []
-
     preds = _filter_by_date(preds, start, end)
 
     out = preds[["timestamp", "symbol", "pred_1d"]].copy()
