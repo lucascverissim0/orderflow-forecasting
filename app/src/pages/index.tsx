@@ -1,228 +1,337 @@
 import { useEffect, useMemo, useState } from "react";
 
-/**
- * Minimal dashboard page (no extra libs).
- * - Fetches symbols from your FastAPI backend
- * - Lets you pick a symbol and time window
- * - Fetches /timeseries and shows key fields in a table
- * - Highlights the latest model score & signal
- *
- * Backend default: http://localhost:8000 (override with NEXT_PUBLIC_API_URL)
- */
+const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
-type Row = {
-  timestamp: string;
-  symbol?: string;
+type SymbolId = string;
+
+interface TimePoint {
+  timestamp: string; // ISO
+  symbol: string;
   close?: number;
   volume?: number;
-  cvd_proxy?: number;
+  cvd?: number;
   pcr?: number;
   at_ask_bias?: number;
-  proba_up_1d?: number;
-  signal_1d?: number;
-};
+}
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+interface PredictionPoint {
+  timestamp: string; // ISO
+  symbol: string;
+  pred_1d: number;
+}
 
-export default function Home() {
-  const [symbols, setSymbols] = useState<string[]>([]);
-  const [symbol, setSymbol] = useState<string>("");
-  const [start, setStart] = useState<string>("");
-  const [end, setEnd] = useState<string>("");
-  const [rows, setRows] = useState<Row[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string>("");
+interface LatestRow {
+  [key: string]: any;
+  timestamp?: string;
+  symbol?: string;
+  pred_1d?: number;
+}
 
-  // Load symbols on mount
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const r = await fetch(`${API}/symbols`);
-        const j = await r.json();
-        const syms: string[] = j.symbols || [];
-        setSymbols(syms);
-        if (syms.length && !symbol) setSymbol(syms[0]);
-      } catch (e: any) {
-        setError(e?.message ?? "Failed to load symbols");
-      }
-    };
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+export default function HomePage() {
+  const [symbols, setSymbols] = useState<SymbolId[]>([]);
+  const [selectedSymbol, setSelectedSymbol] = useState<SymbolId | "">("");
+  const [timeseries, setTimeseries] = useState<TimePoint[]>([]);
+  const [predictions, setPredictions] = useState<PredictionPoint[]>([]);
+  const [latest, setLatest] = useState<LatestRow | null>(null);
 
-  const fetchData = async () => {
-    if (!symbol) return;
-    setLoading(true);
-    setError("");
+  const [loadingSymbols, setLoadingSymbols] = useState(false);
+  const [loadingData, setLoadingData] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // ---- Fetch helpers -------------------------------------------------------
+
+  const fetchSymbols = async () => {
+    setLoadingSymbols(true);
+    setError(null);
     try {
-      const params = new URLSearchParams();
-      params.set("symbol", symbol);
-      if (start) params.set("start", start);
-      if (end) params.set("end", end);
-      params.set("limit", "2000");
-      const r = await fetch(`${API}/timeseries?` + params.toString());
-      const j = await r.json();
-      setRows(j.rows || []);
-    } catch (e: any) {
-      setError(e?.message ?? "Failed to load timeseries");
+      const res = await fetch(`${API_BASE_URL}/symbols`);
+      if (!res.ok) {
+        throw new Error(`Failed to fetch symbols: ${res.status}`);
+      }
+      const data: SymbolId[] = await res.json();
+      setSymbols(data || []);
+      if (data && data.length > 0 && !selectedSymbol) {
+        setSelectedSymbol(data[0]);
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || "Failed to fetch symbols");
     } finally {
-      setLoading(false);
+      setLoadingSymbols(false);
     }
   };
 
-  useEffect(() => {
-    // Auto-load once defaults are ready
-    if (symbol) fetchData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol]);
+  const fetchDataForSymbol = async (symbol: string) => {
+    if (!symbol) return;
+    setLoadingData(true);
+    setError(null);
+    try {
+      const [tsRes, predRes, latestRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/timeseries?symbol=${encodeURIComponent(symbol)}`),
+        fetch(
+          `${API_BASE_URL}/predictions?symbol=${encodeURIComponent(symbol)}`
+        ),
+        fetch(`${API_BASE_URL}/latest?symbol=${encodeURIComponent(symbol)}`),
+      ]);
 
-  const latest = useMemo(() => (rows.length ? rows[rows.length - 1] : undefined), [rows]);
+      if (!tsRes.ok) {
+        throw new Error(`Failed to fetch timeseries: ${tsRes.status}`);
+      }
+      if (!predRes.ok) {
+        throw new Error(`Failed to fetch predictions: ${predRes.status}`);
+      }
+      if (!latestRes.ok) {
+        throw new Error(`Failed to fetch latest: ${latestRes.status}`);
+      }
+
+      const tsData: TimePoint[] = await tsRes.json();
+      const predData: PredictionPoint[] = await predRes.json();
+      const latestData: LatestRow = await latestRes.json();
+
+      setTimeseries(tsData || []);
+      setPredictions(predData || []);
+      setLatest(latestData || null);
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || "Failed to fetch data");
+      setTimeseries([]);
+      setPredictions([]);
+      setLatest(null);
+    } finally {
+      setLoadingData(false);
+    }
+  };
+
+  // ---- Effects -------------------------------------------------------------
+
+  useEffect(() => {
+    fetchSymbols();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (selectedSymbol) {
+      fetchDataForSymbol(selectedSymbol);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSymbol]);
+
+  // ---- Derived table combining price + preds -------------------------------
+
+  const mergedRows = useMemo(() => {
+    if (!timeseries.length) return [];
+
+    const predByTimestamp = new Map<string, number>();
+    for (const p of predictions) {
+      predByTimestamp.set(p.timestamp, p.pred_1d);
+    }
+
+    return timeseries.map((row) => ({
+      ...row,
+      pred_1d: predByTimestamp.get(row.timestamp),
+    }));
+  }, [timeseries, predictions]);
+
+  // ---- UI ------------------------------------------------------------------
 
   return (
-    <main className="min-h-screen p-6" style={{ fontFamily: "ui-sans-serif, system-ui" }}>
-      <div style={{ maxWidth: 1200, margin: "0 auto" }}>
-        <h1 className="text-2xl font-bold mb-2">Orderflow Forecasting (Batch)</h1>
-        <p className="text-sm text-gray-600 mb-6">
-          Select a symbol and time window, then press <b>Refresh</b>. Data comes from your batch pipeline.
-        </p>
+    <main className="min-h-screen bg-slate-950 text-slate-50 px-6 py-8">
+      <div className="max-w-5xl mx-auto space-y-6">
+        <header className="flex flex-col gap-3 sm:flex-row sm:items-baseline sm:justify-between">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              Orderflow Forecasting Dashboard
+            </h1>
+            <p className="text-sm text-slate-400">
+              Batch features + 1-day signals for indices and metals.
+            </p>
+          </div>
+          <span className="text-xs text-slate-500">
+            Backend: <code>{API_BASE_URL}</code>
+          </span>
+        </header>
 
         {/* Controls */}
-        <div
-          className="grid gap-3 mb-6"
-          style={{ gridTemplateColumns: "220px 180px 180px 140px" }}
-        >
-          <select
-            className="border rounded px-3 py-2"
-            value={symbol}
-            onChange={(e) => setSymbol(e.target.value)}
-          >
-            {symbols.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-
-          <input
-            className="border rounded px-3 py-2"
-            type="date"
-            value={start}
-            onChange={(e) => setStart(e.target.value)}
-            placeholder="Start (YYYY-MM-DD)"
-          />
-          <input
-            className="border rounded px-3 py-2"
-            type="date"
-            value={end}
-            onChange={(e) => setEnd(e.target.value)}
-            placeholder="End (YYYY-MM-DD)"
-          />
+        <section className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-2">
+            <label htmlFor="symbol" className="text-sm text-slate-300">
+              Symbol
+            </label>
+            <select
+              id="symbol"
+              className="bg-slate-900 border border-slate-700 rounded-md px-3 py-1 text-sm"
+              value={selectedSymbol}
+              onChange={(e) => setSelectedSymbol(e.target.value)}
+              disabled={loadingSymbols || !symbols.length}
+            >
+              {symbols.length === 0 && (
+                <option value="">No symbols</option>
+              )}
+              {symbols.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+            {loadingSymbols && (
+              <span className="text-xs text-slate-500">Loading…</span>
+            )}
+          </div>
 
           <button
-            className="border rounded px-4 py-2 bg-black text-white disabled:opacity-50"
-            onClick={fetchData}
-            disabled={loading || !symbol}
+            className="self-start inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-800"
+            onClick={() => {
+              fetchSymbols();
+              if (selectedSymbol) {
+                fetchDataForSymbol(selectedSymbol);
+              }
+            }}
           >
-            {loading ? "Loading…" : "Refresh"}
+            Refresh
           </button>
-        </div>
+        </section>
 
-        {/* Latest snapshot */}
-        <div className="mb-6 border rounded p-4">
-          <h2 className="font-semibold mb-2">Latest snapshot</h2>
-          {latest ? (
-            <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(4, minmax(0,1fr))" }}>
-              <Stat label="Timestamp" value={latest.timestamp} />
-              <Stat label="Close" value={fmt(latest.close)} />
-              <Stat label="Proba Up (1d)" value={fmt(latest.proba_up_1d)} />
-              <Stat
-                label="Signal (1d)"
-                value={signalLabel(latest.signal_1d)}
-                emphasis={latest.signal_1d !== 0}
-              />
-            </div>
-          ) : (
-            <p className="text-gray-600 text-sm">No data yet. Try Refresh after running the pipeline.</p>
-          )}
-        </div>
-
-        {/* Table */}
-        <div className="border rounded overflow-x-auto">
-          <table className="min-w-full text-sm">
-            <thead>
-              <tr className="bg-gray-50">
-                <Th>Timestamp (UTC)</Th>
-                <Th>Close</Th>
-                <Th>Volume</Th>
-                <Th>CVD</Th>
-                <Th>PCR</Th>
-                <Th>At-Ask Bias</Th>
-                <Th>Proba Up (1d)</Th>
-                <Th>Signal</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, idx) => (
-                <tr key={idx} className={idx % 2 ? "bg-white" : "bg-gray-50/30"}>
-                  <Td>{r.timestamp}</Td>
-                  <Td>{fmt(r.close)}</Td>
-                  <Td>{fmt(r.volume)}</Td>
-                  <Td>{fmt(r.cvd_proxy)}</Td>
-                  <Td>{fmt(r.pcr)}</Td>
-                  <Td>{fmt(r.at_ask_bias)}</Td>
-                  <Td>{fmt(r.proba_up_1d)}</Td>
-                  <Td>{signalLabel(r.signal_1d)}</Td>
-                </tr>
-              ))}
-              {!rows.length && (
-                <tr>
-                  <td className="p-3 text-gray-600" colSpan={8}>
-                    No rows to display.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-
+        {/* Error / status */}
         {error && (
-          <p className="mt-4 text-red-600 text-sm">
+          <div className="rounded-md border border-red-500/40 bg-red-950/40 px-3 py-2 text-xs text-red-200">
             {error}
-          </p>
+          </div>
         )}
 
-        <p className="mt-6 text-xs text-gray-500">
-          Tip: Set <code>NEXT_PUBLIC_API_URL</code> in <code>app/.env.local</code> to point to your FastAPI server.
-        </p>
+        {/* Latest card */}
+        <section className="grid gap-4 sm:grid-cols-3">
+          <div className="col-span-2 rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+            <h2 className="text-sm font-medium text-slate-200 mb-2">
+              Latest snapshot
+            </h2>
+            {latest && latest.timestamp ? (
+              <div className="text-xs text-slate-300 space-y-1">
+                <div>
+                  <span className="text-slate-500 mr-1">Time:</span>
+                  {latest.timestamp}
+                </div>
+                {latest.close !== undefined && (
+                  <div>
+                    <span className="text-slate-500 mr-1">Close:</span>
+                    {latest.close}
+                  </div>
+                )}
+                {latest.volume !== undefined && (
+                  <div>
+                    <span className="text-slate-500 mr-1">Volume:</span>
+                    {latest.volume}
+                  </div>
+                )}
+                {latest.cvd !== undefined && (
+                  <div>
+                    <span className="text-slate-500 mr-1">CVD:</span>
+                    {latest.cvd}
+                  </div>
+                )}
+                {latest.pcr !== undefined && (
+                  <div>
+                    <span className="text-slate-500 mr-1">Put/Call:</span>
+                    {latest.pcr}
+                  </div>
+                )}
+                {latest.at_ask_bias !== undefined && (
+                  <div>
+                    <span className="text-slate-500 mr-1">At-ask bias:</span>
+                    {latest.at_ask_bias}
+                  </div>
+                )}
+                {latest.pred_1d !== undefined && (
+                  <div>
+                    <span className="text-slate-500 mr-1">Pred 1d:</span>
+                    {latest.pred_1d}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500">
+                No latest data for this symbol yet.
+              </p>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+            <h2 className="text-sm font-medium text-slate-200 mb-2">
+              Status
+            </h2>
+            <ul className="text-xs text-slate-400 space-y-1">
+              <li>
+                Symbols:{" "}
+                {loadingSymbols
+                  ? "loading…"
+                  : symbols.length
+                  ? `${symbols.length} loaded`
+                  : "none"}
+              </li>
+              <li>
+                Timeseries:{" "}
+                {loadingData ? "loading…" : `${timeseries.length} points`}
+              </li>
+              <li>
+                Predictions:{" "}
+                {loadingData ? "loading…" : `${predictions.length} points`}
+              </li>
+            </ul>
+          </div>
+        </section>
+
+        {/* Table */}
+        <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+          <h2 className="text-sm font-medium text-slate-200 mb-3">
+            Timeseries + predictions
+          </h2>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-xs text-left">
+              <thead className="border-b border-slate-800 text-slate-400">
+                <tr>
+                  <th className="py-2 pr-4">Timestamp</th>
+                  <th className="py-2 pr-4">Close</th>
+                  <th className="py-2 pr-4">Volume</th>
+                  <th className="py-2 pr-4">Pred 1d</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mergedRows.length === 0 && (
+                  <tr>
+                    <td
+                      colSpan={4}
+                      className="py-3 text-slate-500 text-center"
+                    >
+                      {loadingData
+                        ? "Loading data…"
+                        : "No data available for this symbol."}
+                    </td>
+                  </tr>
+                )}
+                {mergedRows.map((row) => (
+                  <tr
+                    key={row.timestamp}
+                    className="border-b border-slate-900/60"
+                  >
+                    <td className="py-1 pr-4 text-slate-300">
+                      {row.timestamp}
+                    </td>
+                    <td className="py-1 pr-4">
+                      {row.close !== undefined ? row.close : "-"}
+                    </td>
+                    <td className="py-1 pr-4">
+                      {row.volume !== undefined ? row.volume : "-"}
+                    </td>
+                    <td className="py-1 pr-4">
+                      {row.pred_1d !== undefined ? row.pred_1d : "-"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
       </div>
     </main>
   );
-}
-
-function Th({ children }: { children: any }) {
-  return <th className="text-left p-3 font-medium">{children}</th>;
-}
-function Td({ children }: { children: any }) {
-  return <td className="p-3 whitespace-nowrap">{children ?? "—"}</td>;
-}
-function Stat({ label, value, emphasis = false }: { label: string; value?: string; emphasis?: boolean }) {
-  return (
-    <div className="border rounded p-3">
-      <div className="text-xs text-gray-500">{label}</div>
-      <div className={`text-base ${emphasis ? "font-semibold" : ""}`}>{value ?? "—"}</div>
-    </div>
-  );
-}
-
-function fmt(x?: number) {
-  if (x === null || x === undefined) return undefined;
-  if (Math.abs(x) >= 1000) return x.toLocaleString(undefined, { maximumFractionDigits: 0 });
-  return x.toLocaleString(undefined, { maximumFractionDigits: 4 });
-}
-
-function signalLabel(s?: number) {
-  if (s === 1) return "Long";
-  if (s === -1) return "Short";
-  if (s === 0) return "Flat";
-  return "—";
 }
