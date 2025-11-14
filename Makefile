@@ -11,21 +11,21 @@ UI_PORT   ?= 3000
 
 help:
 	@echo "Targets:"
-	@echo "  setup     - Install Python package (editable) + reqs, and install UI deps"
+	@echo "  setup     - Install Python package (editable) + backend reqs, and install UI deps"
 	@echo "  demo      - Generate synthetic demo data (bars + empty options)"
 	@echo "  features  - Build microstructure + options features"
 	@echo "  labels    - Build forward-return labels"
 	@echo "  train     - Train 1D model"
 	@echo "  score     - Score 1D model -> preds"
 	@echo "  all       - End-to-end: features -> labels -> train -> score"
-	@echo "  api       - Start FastAPI server on port $(API_PORT)"
-	@echo "  ui        - Start Next.js dev server on port $(UI_PORT)"
-	@echo "  clean     - Remove models/reports/processed artifacts"
+	@echo "  api       - Start FastAPI backend (dev)"
+	@echo "  ui        - Start Next.js frontend (dev)"
+	@echo "  clean     - Remove intermediate artifacts"
 
 setup:
 	$(PIP) install -e .
-	@if [ -f requirements.txt ]; then $(PIP) install -r requirements.txt; fi
-	@if [ -f $(APP_DIR)/package.json ]; then npm ci --prefix $(APP_DIR); fi
+	$(PIP) install -r requirements.txt
+	cd $(APP_DIR) && npm install
 
 demo:
 	$(PY) scripts/make_demo_data.py
@@ -46,10 +46,14 @@ score:
 all: features labels train score
 
 api:
-	$(PY) -m uvicorn orderflow.serving.api:app --reload --port $(API_PORT)
+	# FastAPI dev server, listen on all interfaces for Codespaces
+	$(PY) -m uvicorn orderflow.serving.api:app --host 0.0.0.0 --port $(API_PORT) --reload
 
 ui:
-	npm --prefix $(APP_DIR) run dev -- --port $(UI_PORT)
+	# Next dev server; API base URL can be overridden from env
+	cd $(APP_DIR) && \
+	NEXT_PUBLIC_API_BASE_URL=$${NEXT_PUBLIC_API_BASE_URL:-http://localhost:$(API_PORT)} \
+	npm run dev -- --port $(UI_PORT)
 
 clean:
-	@rm -rf models/*.json reports/*.json data/processed/*.parquet 2>/dev/null || true
+	rm -rf data/interim/* data/processed/* models/* reports/*
